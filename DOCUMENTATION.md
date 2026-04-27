@@ -2,7 +2,40 @@
 
 ## Overview
 
-This system manages Charity Week (CW) signup data and automatically matches signups to known institutions. When a signup can't be matched, it's queued for admin review. The system supports three resolution paths — all of which propagate matches automatically via database triggers.
+This system manages Charity Week (CW) signup data and automatically matches signups to known institutions. The long-term operating model is database-first: new signups are inserted directly into `signups`, and triggers handle unmatched institution capture, admin review, alias creation, and backfilling automatically.
+
+The Python scripts in this repo were used for the initial historical cleanup and backfill of older CSV exports. They are useful as a record of the one-time migration process, but they are not the intended ongoing ingestion path.
+
+When a signup can't be matched, it is queued for admin review. The system supports three resolution paths — all of which propagate matches automatically via database triggers.
+
+---
+
+## Current Operating Model
+
+For normal day-to-day use:
+
+1. New rows are inserted directly into `signups`
+2. New fundraising rows are inserted directly into `fundraising`
+3. If a row is unmatched, `institution_review` is populated automatically
+4. Admins resolve the unmatched name by:
+   - linking the review row to an existing institution
+   - adding a new institution
+   - adding an alias to an existing institution
+5. Triggers automatically backfill matching signups or fundraising rows and resolve the review row
+
+The database layer is the product. The review queue, alias propagation, and automatic backfilling all happen inside Postgres/Supabase.
+
+---
+
+## Historical Bootstrap Scripts
+
+These scripts were used to prepare the initial dataset before the trigger-driven workflow was in place:
+
+- `build_institutions.py` builds the initial `institutions.csv`
+- `process_signups_2023.py`, `process_signups_2024.py`, and `process_signups_2025.py` clean legacy signup exports and pre-attach `institution_id` where an exact canonical match exists
+- `process_sponsors.py` cleans and matches sponsorship data for initial import
+
+These scripts are primarily useful for reproducing the historical import, not for steady-state operations.
 
 ---
 
@@ -82,28 +115,57 @@ Individual signup records submitted each CW year.
 
 ### `institution_review`
 
-Admin review queue for unmatched institution names. Each row represents a unique `(cw_year, country_code, institution_name_norm)` combination that couldn't be auto-matched.
+Shared admin review queue for unmatched institution names from both signups and fundraising. Each row represents a unique `(review_source, cw_year, match_scope_key, institution_name_norm)` combination that couldn't be auto-matched.
 
 | Column | Type | Description |
 |--------|------|-------------|
 | `review_id` | `bigserial` | Primary key |
+| `review_source` | `text` | `'signup'` or `'fundraising'` |
 | `cw_year` | `integer` | The CW year |
+| `match_scope_key` | `text` | Matching scope key. For signups this is `country_code`; for fundraising it is `''` because fundraising is name-scoped only |
 | `country` / `country_code` | `text` | Country of the unmatched signups |
 | `institution_name_for_match` | `text` | The name as submitted |
 | `institution_name_norm` | `text` | Normalised name |
 | `representing_institution` | `text` | From the first signup |
 | `participation_type` | `text` | From the first signup |
-| `n_signups` | `integer` | Count of signups with this unmatched name |
+| `n_signups` | `integer` | Count of queued rows for this unmatched name |
 | `alias_institution_id` | `integer` | FK → `institutions`. Set by admin to resolve |
 | `status` | `text` | `'pending'` or `'resolved'` |
 | `suggestions` | `jsonb` | Optional candidate matches (for UI) |
 | `created_at` / `updated_at` | `timestamptz` | Timestamps |
 
-**Unique constraint:** `(cw_year, country_code, institution_name_norm)` — one review row per name per year per country.
+**Unique constraint:** `(review_source, cw_year, match_scope_key, institution_name_norm)` — one review row per source, year, scope, and name.
 
 **Triggers:**
 - `trg_resolve_institution_review` (BEFORE UPDATE of `alias_institution_id`) — backfills signups and marks row as resolved
 - `trg_resolve_institution_review_alias` (AFTER UPDATE of `alias_institution_id`) — records the alias in `institution_aliases`
+
+---
+
+### `fundraising`
+
+Fundraising rows imported from the fundraising feed. These rows can link to known institutions directly, or enter the shared review workflow when `institution_id` is missing.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `sponsor_id` | `bigint` (identity) | Primary key |
+| `cw_year` | `integer` | The CW year |
+| `community_sponsor_id` | `integer` | External fundraising system ID |
+| `institution_name` | `text` | Original institution name from the fundraising row |
+| `institution_name_for_match` | `text` | Prepared display value used for matching/review |
+| `institution_name_norm` | `text` | Lowercase normalised name used for matching |
+| `institution_id` | `integer` | FK → `institutions`. NULL if unmatched |
+| `institution_match_status` | `text` | `'matched'` or NULL |
+| `region` / `state` | `text` | Geographic context from the fundraising file |
+| `launch_good`, `venmo`, `check_amount`, `school_check`, `corporate_match`, `money_order_other`, `total` | `numeric` | Donation amounts by channel |
+| `banking_status` | `text` | Banking state of the fundraising line |
+| `notes` | `text` | Freeform notes |
+
+**Indexes:** `cw_year`, `institution_id`, `(cw_year, institution_name_norm)`, `banking_status`
+
+**Triggers:**
+- `trg_prepare_fundraising_for_match` — on INSERT/UPDATE, prepares the match fields from `institution_name`
+- `trg_capture_unmatched_fundraising` — on INSERT, if `institution_id` is NULL, adds/increments a shared review row in `institution_review`
 
 ---
 
@@ -121,6 +183,18 @@ Admin review queue for unmatched institution names. Each row represents a unique
   - If that combination already exists, increments `n_signups` by 1
 - If `institution_id` is set, or `representing_institution = 'No'`: does nothing
 
+### `fn_capture_unmatched_fundraising()`
+
+**Fires:** AFTER INSERT on `fundraising`
+
+**Purpose:** Automatically queues unmatched fundraising rows for admin review.
+
+**Behaviour:**
+- If `institution_id IS NULL` and `institution_name_norm` is present:
+   - Inserts a row into `institution_review` with `review_source = 'fundraising'`
+   - Uses `match_scope_key = ''`, because fundraising matching is name-scoped only
+   - If that combination already exists, increments `n_signups` by 1
+
 ---
 
 ### 2. `fn_resolve_institution_review()` + `fn_resolve_institution_review_alias()`
@@ -133,8 +207,8 @@ Admin review queue for unmatched institution names. Each row represents a unique
 
 | Phase | Trigger | Actions |
 |-------|---------|---------|
-| BEFORE | `fn_resolve_institution_review` | Updates all unmatched signups matching this `(cw_year, country_code, institution_name_norm)` → sets `institution_id` and `institution_match_status = 'matched'`. Sets `status = 'resolved'` on the review row itself. |
-| AFTER | `fn_resolve_institution_review_alias` | Inserts the alias into `institution_aliases` (with `ON CONFLICT DO NOTHING`). |
+| BEFORE | `fn_resolve_institution_review` | Updates all unmatched source rows matching this review. For signups it uses `(cw_year, country_code, institution_name_norm)`. For fundraising it uses `(cw_year, institution_name_norm)`. Then it sets `status = 'resolved'` on the review row itself. |
+| AFTER | `fn_resolve_institution_review_alias` | Inserts the alias into `institution_aliases` (with `ON CONFLICT DO NOTHING`). Signups use their `country_code`; fundraising inserts a global alias with `country_code = ''`. |
 
 > **Why split?** The BEFORE trigger must set `status = 'resolved'` before the row is committed. The alias insert must happen AFTER the row is committed, because the alias insert fires its own trigger (`fn_auto_match_on_alias_insert`), which would otherwise try to update the same review row mid-transaction, causing a conflict.
 
@@ -148,6 +222,7 @@ Admin review queue for unmatched institution names. Each row represents a unique
 
 **Behaviour:**
 - Finds all signups where `institution_id IS NULL` and `country_code` + `institution_name_norm` match the new institution → sets them to matched
+- Finds all fundraising rows where `institution_id IS NULL` and `institution_name_norm` matches the new institution → sets them to matched
 - Finds all `institution_review` rows with `status = 'pending'` for the same `country_code` + `institution_name_norm` → marks them resolved
 
 ---
@@ -160,7 +235,25 @@ Admin review queue for unmatched institution names. Each row represents a unique
 
 **Behaviour:**
 - Finds all signups where `institution_id IS NULL` and `country_code` + `institution_name_norm` match the alias → sets them to matched
+- Finds all fundraising rows where `institution_id IS NULL` and `institution_name_norm` matches the alias → sets them to matched
 - Finds all pending `institution_review` rows for the same alias → marks them resolved
+
+---
+
+## Fundraising Workflow
+
+Fundraising rows now follow the same shared review queue used by signups.
+
+**Steps:**
+1. Insert a row into `fundraising`
+2. If `institution_id` is already known, the row is treated as matched
+3. If `institution_id` is NULL, the row is normalised and queued in `institution_review` with `review_source = 'fundraising'`
+4. Admins resolve it by updating `institution_review.alias_institution_id`, or by inserting a new institution or alias
+5. Matching fundraising rows are backfilled automatically
+
+**Suggestion policy:**
+- Fuzzy suggestions are generated for fundraising review rows
+- Auto-accept remains disabled for fundraising; fundraising suggestions are manual-only in the current implementation
 
 ---
 

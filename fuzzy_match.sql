@@ -67,6 +67,8 @@ begin
   -- Loop through each pending review row (or just the one specified)
   for v_review in
     select r.review_id,
+        r.review_source,
+        r.match_scope_key,
            r.institution_name_norm,
            r.institution_name_for_match,
            r.country_code,
@@ -102,7 +104,10 @@ begin
           where rt = any(fn_tokenise_institution_name(i.institution_name_norm))
         ), 0) as combined_score
       from public.institutions i
-      where i.country_code = v_review.country_code
+      where (
+          v_review.review_source = 'fundraising'
+          or i.country_code = v_review.match_scope_key
+        )
         and similarity(v_review.institution_name_norm, i.institution_name_norm) > 0.15
 
       union all
@@ -123,7 +128,10 @@ begin
           where rt = any(fn_tokenise_institution_name(a.alias_name_norm))
         ), 0) as combined_score
       from public.institution_aliases a
-      where a.country_code = v_review.country_code
+      where (
+          v_review.review_source = 'fundraising'
+          or a.country_code = v_review.match_scope_key
+        )
         and similarity(v_review.institution_name_norm, a.alias_name_norm) > 0.15
     ) c
     where c.combined_score >= p_min_score
@@ -199,6 +207,7 @@ begin
   update public.institution_review r
   set alias_institution_id = r.suggested_institution_id
   where r.status                  = 'pending'
+    and r.review_source           = 'signup'
     and r.confidence              >= p_threshold
     and r.suggested_institution_id is not null
     and (p_cw_year is null or r.cw_year = p_cw_year)
@@ -226,7 +235,9 @@ select
   r.status,
   r.suggested_institution_id,
   r.suggested_institution_name,
-  r.confidence
+  r.confidence,
+  r.review_source,
+  r.match_scope_key
 from public.institution_review r
 where r.status = 'pending'
 order by

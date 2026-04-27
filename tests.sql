@@ -787,6 +787,336 @@ $$;
 
 
 -- ============================================================
+-- TEST 15: Unmatched fundraising row creates a pending review row
+-- Trigger: trg_prepare_fundraising_for_match + trg_capture_unmatched_fundraising
+-- ============================================================
+do $$
+declare
+  v_review_count int;
+  v_n_signups int;
+  v_status text;
+  v_name_for_match text;
+  v_name_norm text;
+begin
+  raise notice '--- TEST 15: Unmatched fundraising row creates a pending review row ---';
+
+  insert into public.fundraising (
+    cw_year,
+    community_sponsor_id,
+    institution_name
+  ) values (
+    9999,
+    99001,
+    'Test Fundraising University'
+  );
+
+  select institution_name_for_match, institution_name_norm
+  into v_name_for_match, v_name_norm
+  from public.fundraising
+  where cw_year = 9999
+    and community_sponsor_id = 99001;
+
+  assert v_name_for_match = 'Test Fundraising University',
+    'FAIL: Expected institution_name_for_match to be prepared from institution_name';
+  assert v_name_norm = 'test fundraising university',
+    'FAIL: Expected institution_name_norm to be normalized, got ' || coalesce(v_name_norm, 'NULL');
+
+  select count(*), max(n_signups), max(status)
+  into v_review_count, v_n_signups, v_status
+  from public.institution_review
+  where review_source = 'fundraising'
+    and cw_year = 9999
+    and match_scope_key = ''
+    and institution_name_norm = 'test fundraising university';
+
+  assert v_review_count = 1,
+    'FAIL: Expected 1 fundraising review row, got ' || v_review_count;
+  assert v_n_signups = 1,
+    'FAIL: Expected n_signups = 1, got ' || v_n_signups;
+  assert v_status = 'pending',
+    'FAIL: Expected status = pending, got ' || coalesce(v_status, 'NULL');
+
+  raise notice 'PASS: Fundraising row normalized and queued for review';
+
+  delete from public.institution_review where cw_year = 9999 and review_source = 'fundraising';
+  delete from public.fundraising where cw_year = 9999;
+end;
+$$;
+
+
+-- ============================================================
+-- TEST 16: Second unmatched fundraising row increments n_signups
+-- Trigger: trg_capture_unmatched_fundraising (ON CONFLICT)
+-- ============================================================
+do $$
+declare
+  v_review_count int;
+  v_n_signups int;
+begin
+  raise notice '--- TEST 16: Duplicate fundraising name increments review count ---';
+
+  insert into public.fundraising (cw_year, community_sponsor_id, institution_name)
+  values
+    (9999, 99002, 'Fundraising Queue Uni'),
+    (9999, 99003, 'Fundraising Queue Uni');
+
+  select count(*), max(n_signups)
+  into v_review_count, v_n_signups
+  from public.institution_review
+  where review_source = 'fundraising'
+    and cw_year = 9999
+    and match_scope_key = ''
+    and institution_name_norm = 'fundraising queue uni';
+
+  assert v_review_count = 1,
+    'FAIL: Expected 1 fundraising review row, got ' || v_review_count;
+  assert v_n_signups = 2,
+    'FAIL: Expected n_signups = 2, got ' || v_n_signups;
+
+  raise notice 'PASS: Fundraising review row reused and incremented';
+
+  delete from public.institution_review where cw_year = 9999 and review_source = 'fundraising';
+  delete from public.fundraising where cw_year = 9999;
+end;
+$$;
+
+
+-- ============================================================
+-- TEST 17: Resolving a fundraising review backfills rows + creates alias
+-- Trigger: trg_resolve_institution_review + trg_resolve_institution_review_alias
+-- ============================================================
+do $$
+declare
+  v_inst_id int;
+  v_review_id bigint;
+  v_matched_count int;
+  v_alias_count int;
+  v_review_status text;
+begin
+  raise notice '--- TEST 17: Resolving fundraising review backfills rows + creates alias ---';
+
+  insert into public.institutions (institution_id, country, country_code, name_canonical, institution_name_norm)
+  values (999012, 'USA', 'US', 'Fundraising Correct Uni', 'fundraising correct uni')
+  returning institution_id into v_inst_id;
+
+  insert into public.fundraising (cw_year, community_sponsor_id, institution_name)
+  values
+    (9999, 99004, 'Fundrasing Correct Uni'),
+    (9999, 99005, 'Fundrasing Correct Uni');
+
+  select review_id into v_review_id
+  from public.institution_review
+  where review_source = 'fundraising'
+    and cw_year = 9999
+    and institution_name_norm = 'fundrasing correct uni';
+
+  assert v_review_id is not null, 'FAIL: Fundraising review row should exist';
+
+  update public.institution_review
+  set alias_institution_id = v_inst_id
+  where review_id = v_review_id;
+
+  select count(*) into v_matched_count
+  from public.fundraising
+  where cw_year = 9999
+    and institution_name_norm = 'fundrasing correct uni'
+    and institution_id = v_inst_id
+    and institution_match_status = 'matched';
+
+  assert v_matched_count = 2,
+    'FAIL: Both fundraising rows should be matched, got ' || v_matched_count;
+
+  select count(*) into v_alias_count
+  from public.institution_aliases
+  where institution_id = v_inst_id
+    and alias_name_norm = 'fundrasing correct uni'
+    and country_code = '';
+
+  assert v_alias_count = 1,
+    'FAIL: Expected 1 global alias for fundraising review, got ' || v_alias_count;
+
+  select status into v_review_status
+  from public.institution_review
+  where review_id = v_review_id;
+
+  assert v_review_status = 'resolved',
+    'FAIL: Fundraising review should be resolved, got ' || coalesce(v_review_status, 'NULL');
+
+  raise notice 'PASS: Fundraising review resolution backfilled rows and inserted alias';
+
+  delete from public.fundraising where cw_year = 9999;
+  delete from public.institution_review where cw_year = 9999 and review_source = 'fundraising';
+  delete from public.institution_aliases where institution_id = v_inst_id;
+  delete from public.institutions where institution_id = v_inst_id;
+end;
+$$;
+
+
+-- ============================================================
+-- TEST 18: New institution auto-matches existing unmatched fundraising rows
+-- Trigger: trg_auto_match_on_new_institution
+-- ============================================================
+do $$
+declare
+  v_inst_id int;
+  v_fundraising_inst_id int;
+  v_match_status text;
+  v_review_status text;
+begin
+  raise notice '--- TEST 18: New institution auto-matches fundraising rows ---';
+
+  insert into public.fundraising (cw_year, community_sponsor_id, institution_name)
+  values (9999, 99006, 'Fresh Fundraising Uni');
+
+  insert into public.institutions (institution_id, country, country_code, name_canonical, institution_name_norm)
+  values (999013, 'USA', 'US', 'Fresh Fundraising Uni', 'fresh fundraising uni')
+  returning institution_id into v_inst_id;
+
+  select institution_id, institution_match_status
+  into v_fundraising_inst_id, v_match_status
+  from public.fundraising
+  where cw_year = 9999
+    and community_sponsor_id = 99006;
+
+  assert v_fundraising_inst_id = v_inst_id,
+    'FAIL: Fundraising row should be matched to new institution';
+  assert v_match_status = 'matched',
+    'FAIL: Fundraising row should be marked matched, got ' || coalesce(v_match_status, 'NULL');
+
+  select status into v_review_status
+  from public.institution_review
+  where review_source = 'fundraising'
+    and cw_year = 9999
+    and institution_name_norm = 'fresh fundraising uni';
+
+  assert v_review_status = 'resolved',
+    'FAIL: Fundraising review should be resolved, got ' || coalesce(v_review_status, 'NULL');
+
+  raise notice 'PASS: Institution insert matched fundraising row and resolved review';
+
+  delete from public.fundraising where cw_year = 9999;
+  delete from public.institution_review where cw_year = 9999 and review_source = 'fundraising';
+  delete from public.institution_aliases where institution_id = v_inst_id;
+  delete from public.institutions where institution_id = v_inst_id;
+end;
+$$;
+
+
+-- ============================================================
+-- TEST 19: Alias insert auto-matches unmatched fundraising rows
+-- Trigger: trg_auto_match_on_alias_insert
+-- ============================================================
+do $$
+declare
+  v_inst_id int;
+  v_fundraising_inst_id int;
+  v_match_status text;
+  v_review_status text;
+begin
+  raise notice '--- TEST 19: Alias insert auto-matches fundraising rows ---';
+
+  insert into public.institutions (institution_id, country, country_code, name_canonical, institution_name_norm)
+  values (999014, 'USA', 'US', 'Fundraising Alias Uni', 'fundraising alias uni')
+  returning institution_id into v_inst_id;
+
+  insert into public.fundraising (cw_year, community_sponsor_id, institution_name)
+  values (9999, 99007, 'Fundrasing Alias Uni');
+
+  insert into public.institution_aliases (institution_id, country_code, alias_name, alias_name_norm)
+  values (v_inst_id, 'US', 'Fundrasing Alias Uni', 'fundrasing alias uni');
+
+  select institution_id, institution_match_status
+  into v_fundraising_inst_id, v_match_status
+  from public.fundraising
+  where cw_year = 9999
+    and community_sponsor_id = 99007;
+
+  assert v_fundraising_inst_id = v_inst_id,
+    'FAIL: Fundraising row should be matched via alias';
+  assert v_match_status = 'matched',
+    'FAIL: Fundraising row should be marked matched, got ' || coalesce(v_match_status, 'NULL');
+
+  select status into v_review_status
+  from public.institution_review
+  where review_source = 'fundraising'
+    and cw_year = 9999
+    and institution_name_norm = 'fundrasing alias uni';
+
+  assert v_review_status = 'resolved',
+    'FAIL: Fundraising review should be resolved, got ' || coalesce(v_review_status, 'NULL');
+
+  raise notice 'PASS: Alias insert matched fundraising row and resolved review';
+
+  delete from public.fundraising where cw_year = 9999;
+  delete from public.institution_review where cw_year = 9999 and review_source = 'fundraising';
+  delete from public.institution_aliases where institution_id = v_inst_id;
+  delete from public.institutions where institution_id = v_inst_id;
+end;
+$$;
+
+
+-- ============================================================
+-- TEST 20: Auto-accept suggestions does not auto-resolve fundraising reviews
+-- Function: fn_auto_accept_suggestions
+-- ============================================================
+do $$
+declare
+  v_inst_id int;
+  v_status text;
+  v_alias_inst_id int;
+begin
+  raise notice '--- TEST 20: Fundraising suggestions stay manual-only ---';
+
+  insert into public.institutions (institution_id, country, country_code, name_canonical, institution_name_norm)
+  values (999015, 'USA', 'US', 'Manual Suggestion Uni', 'manual suggestion uni')
+  returning institution_id into v_inst_id;
+
+  insert into public.institution_review (
+    review_source,
+    cw_year,
+    match_scope_key,
+    institution_name_for_match,
+    institution_name_norm,
+    n_signups,
+    suggested_institution_id,
+    suggested_institution_name,
+    confidence
+  ) values (
+    'fundraising',
+    9999,
+    '',
+    'Manual Suggestion Uni',
+    'manual suggestion uni',
+    1,
+    v_inst_id,
+    'Manual Suggestion Uni',
+    100
+  );
+
+  perform public.fn_auto_accept_suggestions();
+
+  select status, alias_institution_id
+  into v_status, v_alias_inst_id
+  from public.institution_review
+  where review_source = 'fundraising'
+    and cw_year = 9999
+    and institution_name_norm = 'manual suggestion uni';
+
+  assert v_status = 'pending',
+    'FAIL: Fundraising review should remain pending, got ' || coalesce(v_status, 'NULL');
+  assert v_alias_inst_id is null,
+    'FAIL: Fundraising review should not be auto-accepted';
+
+  raise notice 'PASS: Fundraising suggestions remain manual-only';
+
+  delete from public.institution_review where cw_year = 9999 and review_source = 'fundraising';
+  delete from public.institution_aliases where institution_id = v_inst_id;
+  delete from public.institutions where institution_id = v_inst_id;
+end;
+$$;
+
+
+-- ============================================================
 -- SUMMARY
 -- ============================================================
 do $$

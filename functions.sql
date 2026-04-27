@@ -1,3 +1,50 @@
+create or replace function public.fn_normalize_institution_name(input_name text)
+returns text
+language sql
+immutable
+as $$
+  select nullif(
+    trim(
+      regexp_replace(
+        regexp_replace(lower(coalesce(input_name, '')), '[^a-z0-9]+', ' ', 'g'),
+        '\s+',
+        ' ',
+        'g'
+      )
+    ),
+    ''
+  );
+$$;
+
+
+create or replace function public.fn_prepare_fundraising_for_match()
+returns trigger
+language plpgsql
+security definer
+as $$
+begin
+  new.institution_name_for_match := nullif(btrim(coalesce(new.institution_name, '')), '');
+  new.institution_name_norm := public.fn_normalize_institution_name(new.institution_name_for_match);
+
+  if new.institution_id is not null then
+    new.institution_match_status := 'matched';
+  elsif new.institution_match_status = 'matched' then
+    new.institution_match_status := null;
+  end if;
+
+  return new;
+end;
+$$;
+
+drop trigger if exists trg_prepare_fundraising_for_match on public.fundraising;
+
+create trigger trg_prepare_fundraising_for_match
+before insert or update of institution_name, institution_id
+on public.fundraising
+for each row
+execute function public.fn_prepare_fundraising_for_match();
+
+
 create or replace function public.fn_resolve_institution_review()
 returns trigger
 language plpgsql
@@ -9,14 +56,22 @@ begin
      and (old.alias_institution_id is null
           or old.alias_institution_id <> new.alias_institution_id) then
 
-    -- 1) Update all matching signups that are currently unmatched
-    update public.signups s
-    set institution_id           = new.alias_institution_id,
-        institution_match_status = 'matched'
-    where s.institution_id is null
-      and s.cw_year      = new.cw_year
-      and s.country_code = new.country_code
-      and s.institution_name_norm = new.institution_name_norm;
+    if new.review_source = 'fundraising' then
+      update public.fundraising f
+      set institution_id           = new.alias_institution_id,
+          institution_match_status = 'matched'
+      where f.institution_id is null
+        and f.cw_year              = new.cw_year
+        and f.institution_name_norm = new.institution_name_norm;
+    else
+      update public.signups s
+      set institution_id           = new.alias_institution_id,
+          institution_match_status = 'matched'
+      where s.institution_id is null
+        and s.cw_year              = new.cw_year
+        and coalesce(s.country_code, '') = new.match_scope_key
+        and s.institution_name_norm = new.institution_name_norm;
+    end if;
 
     -- 2) Mark this review row as resolved (works because this is a BEFORE trigger)
     new.status     := 'resolved';
@@ -46,7 +101,7 @@ begin
       alias_name_norm
     ) values (
       new.alias_institution_id,
-      new.country_code,
+      new.match_scope_key,
       new.institution_name_for_match,
       new.institution_name_norm
     )
@@ -84,10 +139,13 @@ as $$
 begin
   -- condition: no institution_id AND they’re representing an institution
   if new.institution_id is null
+     and new.institution_name_norm is not null
      and coalesce(new.representing_institution, 'Yes') = 'Yes'
   then
     insert into public.institution_review (
+      review_source,
       cw_year,
+      match_scope_key,
       country,
       country_code,
       institution_name_for_match,
@@ -97,7 +155,9 @@ begin
       n_signups
     )
     values (
+      'signup',
       new.cw_year,
+      coalesce(new.country_code, ''),
       new.country,
       new.country_code,
       new.institution_name_for_match,
@@ -106,7 +166,42 @@ begin
       new.participation_type,
       1
     )
-    on conflict (cw_year, country_code, institution_name_norm)
+    on conflict (review_source, cw_year, match_scope_key, institution_name_norm)
+    do update
+      set n_signups = institution_review.n_signups + 1,
+          updated_at = now();
+  end if;
+
+  return new;
+end;
+$$;
+
+create or replace function public.fn_capture_unmatched_fundraising()
+returns trigger
+language plpgsql
+security definer
+as $$
+begin
+  if new.institution_id is null
+     and new.institution_name_norm is not null
+  then
+    insert into public.institution_review (
+      review_source,
+      cw_year,
+      match_scope_key,
+      institution_name_for_match,
+      institution_name_norm,
+      n_signups
+    )
+    values (
+      'fundraising',
+      new.cw_year,
+      '',
+      new.institution_name_for_match,
+      new.institution_name_norm,
+      1
+    )
+    on conflict (review_source, cw_year, match_scope_key, institution_name_norm)
     do update
       set n_signups = institution_review.n_signups + 1,
           updated_at = now();
@@ -121,6 +216,12 @@ create trigger trg_capture_unmatched_institution
 after insert on public.signups
 for each row
 execute function public.fn_capture_unmatched_institution();
+
+drop trigger if exists trg_capture_unmatched_fundraising on public.fundraising;
+create trigger trg_capture_unmatched_fundraising
+after insert on public.fundraising
+for each row
+execute function public.fn_capture_unmatched_fundraising();
 
 
 
@@ -138,15 +239,25 @@ begin
     and s.country_code         = new.country_code
     and s.institution_name_norm = new.institution_name_norm;
 
-  -- 2) Resolve any pending institution_review rows for the same name + country
+  -- 2) Match any unmatched fundraising rows with the same normalised name
+  update public.fundraising f
+  set institution_id           = new.institution_id,
+      institution_match_status = 'matched'
+  where f.institution_id is null
+    and f.institution_name_norm = new.institution_name_norm;
+
+  -- 3) Resolve any pending institution_review rows for the same name
   update public.institution_review r
   set alias_institution_id = new.institution_id,
       status               = 'resolved',
       updated_at           = now()
   where r.status                = 'pending'
-    and r.country_code          = new.country_code
+    and r.alias_institution_id  is null
     and r.institution_name_norm = new.institution_name_norm
-    and r.alias_institution_id  is null;
+    and (
+      (r.review_source = 'signup' and r.match_scope_key = new.country_code)
+      or (r.review_source = 'fundraising' and r.match_scope_key = '')
+    );
 
   return new;
 end;
@@ -180,7 +291,14 @@ begin
     and s.institution_name_norm = new.alias_name_norm
     and s.country_code          = new.country_code;
 
-  -- 2) Resolve any pending institution_review rows for this alias
+  -- 2) Match any unmatched fundraising rows whose norm name matches this alias
+  update public.fundraising f
+  set institution_id           = new.institution_id,
+      institution_match_status = 'matched'
+  where f.institution_id is null
+    and f.institution_name_norm = new.alias_name_norm;
+
+  -- 3) Resolve any pending institution_review rows for this alias
   update public.institution_review r
   set alias_institution_id = new.institution_id,
       status               = 'resolved',
@@ -188,7 +306,10 @@ begin
   where r.status                = 'pending'
     and r.alias_institution_id  is null
     and r.institution_name_norm = new.alias_name_norm
-    and r.country_code          = new.country_code;
+    and (
+      (r.review_source = 'signup' and r.match_scope_key = new.country_code)
+      or (r.review_source = 'fundraising' and r.match_scope_key = '')
+    );
 
   return new;
 end;
