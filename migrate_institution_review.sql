@@ -13,7 +13,8 @@
 -- Step 1: add the new shared-queue columns without dropping data.
 alter table public.institution_review
   add column if not exists review_source text,
-  add column if not exists match_scope_key text;
+  add column if not exists match_scope_key text,
+  add column if not exists resolve_via text null;
 
 alter table public.institution_review
   alter column review_source set default 'signup'::text,

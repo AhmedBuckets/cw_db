@@ -28,13 +28,51 @@ begin
 
   if new.institution_id is not null then
     new.institution_match_status := 'matched';
+    -- Only set match_source if the caller didn't supply one (preserves auto/manual sources)
+    if new.match_source is null then
+      new.match_source := 'exact_name_norm';
+    end if;
   elsif new.institution_match_status = 'matched' then
     new.institution_match_status := null;
+    new.match_source := null;
   end if;
 
   return new;
 end;
 $$;
+
+
+-- match_source values:
+--   exact_name_norm        — institution_id was provided at insert time (pre-matched by caller)
+--   auto_institution_insert — matched automatically when a new institution was inserted
+--   auto_alias_insert      — matched automatically when a new alias was inserted
+--   fuzzy_auto_accept      — matched via fuzzy suggestion auto-accept (signup-only)
+--   manual_admin           — matched by an admin resolving an institution_review row
+create or replace function public.fn_prepare_signup_for_match()
+returns trigger
+language plpgsql
+security definer
+as $$
+begin
+  if new.institution_id is not null then
+    if new.match_source is null then
+      new.match_source := 'exact_name_norm';
+    end if;
+  elsif new.institution_id is null then
+    new.match_source := null;
+  end if;
+
+  return new;
+end;
+$$;
+
+drop trigger if exists trg_prepare_signup_for_match on public.signups;
+
+create trigger trg_prepare_signup_for_match
+before insert or update of institution_id
+on public.signups
+for each row
+execute function public.fn_prepare_signup_for_match();
 
 drop trigger if exists trg_prepare_fundraising_for_match on public.fundraising;
 
@@ -50,23 +88,30 @@ returns trigger
 language plpgsql
 security definer
 as $$
+declare
+  v_match_source text;
 begin
   -- Only act when alias_institution_id changes from NULL -> some value
   if new.alias_institution_id is not null
      and (old.alias_institution_id is null
           or old.alias_institution_id <> new.alias_institution_id) then
 
+    -- Caller sets resolve_via on the row to signal the match origin; default to 'manual_admin'
+    v_match_source := coalesce(new.resolve_via, 'manual_admin');
+
     if new.review_source = 'fundraising' then
       update public.fundraising f
       set institution_id           = new.alias_institution_id,
-          institution_match_status = 'matched'
+          institution_match_status = 'matched',
+          match_source             = v_match_source
       where f.institution_id is null
         and f.cw_year              = new.cw_year
         and f.institution_name_norm = new.institution_name_norm;
     else
       update public.signups s
       set institution_id           = new.alias_institution_id,
-          institution_match_status = 'matched'
+          institution_match_status = 'matched',
+          match_source             = v_match_source
       where s.institution_id is null
         and s.cw_year              = new.cw_year
         and coalesce(s.country_code, '') = new.match_scope_key
@@ -224,6 +269,28 @@ for each row
 execute function public.fn_capture_unmatched_fundraising();
 
 
+create or replace function public.fn_initialize_institution_parent_id()
+returns trigger
+language plpgsql
+security definer
+as $$
+begin
+  if new.parent_id is null then
+    new.parent_id := new.institution_id;
+  end if;
+
+  return new;
+end;
+$$;
+
+drop trigger if exists trg_initialize_institution_parent_id on public.institutions;
+
+create trigger trg_initialize_institution_parent_id
+before insert on public.institutions
+for each row
+execute function public.fn_initialize_institution_parent_id();
+
+
 
 create or replace function public.fn_auto_match_on_new_institution()
 returns trigger
@@ -234,7 +301,8 @@ begin
   -- 1) Match any unmatched signups whose normalised name + country match
   update public.signups s
   set institution_id           = new.institution_id,
-      institution_match_status = 'matched'
+      institution_match_status = 'matched',
+      match_source             = 'auto_institution_insert'
   where s.institution_id is null
     and s.country_code         = new.country_code
     and s.institution_name_norm = new.institution_name_norm;
@@ -242,7 +310,8 @@ begin
   -- 2) Match any unmatched fundraising rows with the same normalised name
   update public.fundraising f
   set institution_id           = new.institution_id,
-      institution_match_status = 'matched'
+      institution_match_status = 'matched',
+      match_source             = 'auto_institution_insert'
   where f.institution_id is null
     and f.institution_name_norm = new.institution_name_norm;
 
@@ -286,7 +355,8 @@ begin
   -- 1) Match any unmatched signups whose norm name + country match this alias
   update public.signups s
   set institution_id           = new.institution_id,
-      institution_match_status = 'matched'
+      institution_match_status = 'matched',
+      match_source             = 'auto_alias_insert'
   where s.institution_id is null
     and s.institution_name_norm = new.alias_name_norm
     and s.country_code          = new.country_code;
@@ -294,7 +364,8 @@ begin
   -- 2) Match any unmatched fundraising rows whose norm name matches this alias
   update public.fundraising f
   set institution_id           = new.institution_id,
-      institution_match_status = 'matched'
+      institution_match_status = 'matched',
+      match_source             = 'auto_alias_insert'
   where f.institution_id is null
     and f.institution_name_norm = new.alias_name_norm;
 

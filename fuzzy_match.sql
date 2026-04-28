@@ -205,7 +205,8 @@ as $$
 begin
   return query
   update public.institution_review r
-  set alias_institution_id = r.suggested_institution_id
+  set alias_institution_id = r.suggested_institution_id,
+      resolve_via          = 'fuzzy_auto_accept'
   where r.status                  = 'pending'
     and r.review_source           = 'signup'
     and r.confidence              >= p_threshold

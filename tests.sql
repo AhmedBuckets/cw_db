@@ -1117,6 +1117,478 @@ $$;
 
 
 -- ============================================================
+-- TEST 21: Signup inserted with institution_id → match_source = 'exact_name_norm'
+-- Trigger: trg_prepare_signup_for_match
+-- ============================================================
+do $$
+declare
+  v_inst_id    int;
+  v_src        text;
+begin
+  raise notice '--- TEST 21: Pre-matched signup gets match_source = exact_name_norm ---';
+
+  insert into public.institutions (institution_id, country, country_code, name_canonical, institution_name_norm)
+  values (999020, 'UK', 'GB', 'Pre Matched Signup Uni', 'pre matched signup uni')
+  returning institution_id into v_inst_id;
+
+  insert into public.signups (
+    cw_year, signup_timestamp, full_name, email,
+    representing_institution, participation_type,
+    institution_id, institution_match_status,
+    institution_name_for_match, institution_name_norm,
+    country, country_code
+  ) values (
+    9999, now(), 'Pre Match User', 'prematch@test.com',
+    'Yes', 'University',
+    v_inst_id, 'matched',
+    'Pre Matched Signup Uni', 'pre matched signup uni',
+    'UK', 'GB'
+  );
+
+  select match_source into v_src
+  from public.signups
+  where cw_year = 9999 and email = 'prematch@test.com';
+
+  assert v_src = 'exact_name_norm',
+    'FAIL: Expected match_source = exact_name_norm, got ' || coalesce(v_src, 'NULL');
+
+  raise notice 'PASS: Pre-matched signup has match_source = exact_name_norm';
+
+  delete from public.signups where cw_year = 9999;
+  delete from public.institution_aliases where institution_id = v_inst_id;
+  delete from public.institutions where institution_id = v_inst_id;
+end;
+$$;
+
+
+-- ============================================================
+-- TEST 22: Fundraising inserted with institution_id → match_source = 'exact_name_norm'
+-- Trigger: trg_prepare_fundraising_for_match
+-- ============================================================
+do $$
+declare
+  v_inst_id int;
+  v_src     text;
+begin
+  raise notice '--- TEST 22: Pre-matched fundraising row gets match_source = exact_name_norm ---';
+
+  insert into public.institutions (institution_id, country, country_code, name_canonical, institution_name_norm)
+  values (999021, 'USA', 'US', 'Pre Matched Fundraising Uni', 'pre matched fundraising uni')
+  returning institution_id into v_inst_id;
+
+  insert into public.fundraising (cw_year, community_sponsor_id, institution_name, institution_id)
+  values (9999, 99020, 'Pre Matched Fundraising Uni', v_inst_id);
+
+  select match_source into v_src
+  from public.fundraising
+  where cw_year = 9999 and community_sponsor_id = 99020;
+
+  assert v_src = 'exact_name_norm',
+    'FAIL: Expected match_source = exact_name_norm, got ' || coalesce(v_src, 'NULL');
+
+  raise notice 'PASS: Pre-matched fundraising row has match_source = exact_name_norm';
+
+  delete from public.fundraising where cw_year = 9999;
+  delete from public.institution_review where cw_year = 9999;
+  delete from public.institution_aliases where institution_id = v_inst_id;
+  delete from public.institutions where institution_id = v_inst_id;
+end;
+$$;
+
+
+-- ============================================================
+-- TEST 23: Auto-match on institution insert → match_source = 'auto_institution_insert'
+-- Trigger: trg_auto_match_on_new_institution
+-- ============================================================
+do $$
+declare
+  v_inst_id     int;
+  v_src_signup  text;
+  v_src_fund    text;
+begin
+  raise notice '--- TEST 23: Institution insert sets match_source = auto_institution_insert ---';
+
+  insert into public.signups (
+    cw_year, signup_timestamp, full_name, email,
+    representing_institution, participation_type,
+    institution_name_for_match, institution_name_norm,
+    country, country_code
+  ) values (
+    9999, now(), 'Auto Inst User', 'autoinst@test.com',
+    'Yes', 'University',
+    'Auto Inst Match Uni', 'auto inst match uni',
+    'UK', 'GB'
+  );
+
+  insert into public.fundraising (cw_year, community_sponsor_id, institution_name)
+  values (9999, 99021, 'Auto Inst Match Uni');
+
+  insert into public.institutions (institution_id, country, country_code, name_canonical, institution_name_norm)
+  values (999022, 'UK', 'GB', 'Auto Inst Match Uni', 'auto inst match uni')
+  returning institution_id into v_inst_id;
+
+  select match_source into v_src_signup
+  from public.signups
+  where cw_year = 9999 and email = 'autoinst@test.com';
+
+  select match_source into v_src_fund
+  from public.fundraising
+  where cw_year = 9999 and community_sponsor_id = 99021;
+
+  assert v_src_signup = 'auto_institution_insert',
+    'FAIL (signup): Expected auto_institution_insert, got ' || coalesce(v_src_signup, 'NULL');
+  assert v_src_fund = 'auto_institution_insert',
+    'FAIL (fundraising): Expected auto_institution_insert, got ' || coalesce(v_src_fund, 'NULL');
+
+  raise notice 'PASS: Both signup and fundraising row have match_source = auto_institution_insert';
+
+  delete from public.signups where cw_year = 9999;
+  delete from public.fundraising where cw_year = 9999;
+  delete from public.institution_review where cw_year = 9999;
+  delete from public.institution_aliases where institution_id = v_inst_id;
+  delete from public.institutions where institution_id = v_inst_id;
+end;
+$$;
+
+
+-- ============================================================
+-- TEST 24: Auto-match on alias insert → match_source = 'auto_alias_insert'
+-- Trigger: trg_auto_match_on_alias_insert
+-- ============================================================
+do $$
+declare
+  v_inst_id    int;
+  v_src_signup text;
+  v_src_fund   text;
+begin
+  raise notice '--- TEST 24: Alias insert sets match_source = auto_alias_insert ---';
+
+  insert into public.institutions (institution_id, country, country_code, name_canonical, institution_name_norm)
+  values (999023, 'UK', 'GB', 'Alias Match Canonical Uni', 'alias match canonical uni')
+  returning institution_id into v_inst_id;
+
+  insert into public.signups (
+    cw_year, signup_timestamp, full_name, email,
+    representing_institution, participation_type,
+    institution_name_for_match, institution_name_norm,
+    country, country_code
+  ) values (
+    9999, now(), 'Alias Match User', 'aliasmatch@test.com',
+    'Yes', 'University',
+    'Alias Match Variant Uni', 'alias match variant uni',
+    'UK', 'GB'
+  );
+
+  insert into public.fundraising (cw_year, community_sponsor_id, institution_name)
+  values (9999, 99022, 'Alias Match Variant Uni');
+
+  insert into public.institution_aliases (institution_id, country_code, alias_name, alias_name_norm)
+  values (v_inst_id, 'GB', 'Alias Match Variant Uni', 'alias match variant uni');
+
+  select match_source into v_src_signup
+  from public.signups
+  where cw_year = 9999 and email = 'aliasmatch@test.com';
+
+  select match_source into v_src_fund
+  from public.fundraising
+  where cw_year = 9999 and community_sponsor_id = 99022;
+
+  assert v_src_signup = 'auto_alias_insert',
+    'FAIL (signup): Expected auto_alias_insert, got ' || coalesce(v_src_signup, 'NULL');
+  assert v_src_fund = 'auto_alias_insert',
+    'FAIL (fundraising): Expected auto_alias_insert, got ' || coalesce(v_src_fund, 'NULL');
+
+  raise notice 'PASS: Both signup and fundraising row have match_source = auto_alias_insert';
+
+  delete from public.signups where cw_year = 9999;
+  delete from public.fundraising where cw_year = 9999;
+  delete from public.institution_review where cw_year = 9999;
+  delete from public.institution_aliases where institution_id = v_inst_id;
+  delete from public.institutions where institution_id = v_inst_id;
+end;
+$$;
+
+
+-- ============================================================
+-- TEST 25: Manual review resolution → match_source = 'manual_admin'
+-- Trigger: trg_resolve_institution_review
+-- ============================================================
+do $$
+declare
+  v_inst_id  int;
+  v_review_id bigint;
+  v_src      text;
+begin
+  raise notice '--- TEST 25: Manual review resolution sets match_source = manual_admin ---';
+
+  insert into public.institutions (institution_id, country, country_code, name_canonical, institution_name_norm)
+  values (999024, 'UK', 'GB', 'Manual Admin Uni', 'manual admin uni')
+  returning institution_id into v_inst_id;
+
+  insert into public.signups (
+    cw_year, signup_timestamp, full_name, email,
+    representing_institution, participation_type,
+    institution_name_for_match, institution_name_norm,
+    country, country_code
+  ) values (
+    9999, now(), 'Manual Admin User', 'manualadmin@test.com',
+    'Yes', 'University',
+    'Manuaal Admin Uni', 'manuaal admin uni',
+    'UK', 'GB'
+  );
+
+  select review_id into v_review_id
+  from public.institution_review
+  where cw_year = 9999 and institution_name_norm = 'manuaal admin uni';
+
+  assert v_review_id is not null, 'FAIL: Review row should exist';
+
+  update public.institution_review
+  set alias_institution_id = v_inst_id
+  where review_id = v_review_id;
+
+  select match_source into v_src
+  from public.signups
+  where cw_year = 9999 and email = 'manualadmin@test.com';
+
+  assert v_src = 'manual_admin',
+    'FAIL: Expected match_source = manual_admin, got ' || coalesce(v_src, 'NULL');
+
+  raise notice 'PASS: Manually resolved signup has match_source = manual_admin';
+
+  delete from public.signups where cw_year = 9999;
+  delete from public.institution_review where cw_year = 9999;
+  delete from public.institution_aliases where institution_id = v_inst_id;
+  delete from public.institutions where institution_id = v_inst_id;
+end;
+$$;
+
+
+-- ============================================================
+-- TEST 26: Fuzzy auto-accept → match_source = 'fuzzy_auto_accept'
+-- Function: fn_auto_accept_suggestions (signup only)
+-- ============================================================
+do $$
+declare
+  v_inst_id   int;
+  v_review_id bigint;
+  v_src       text;
+begin
+  raise notice '--- TEST 26: Fuzzy auto-accept sets match_source = fuzzy_auto_accept ---';
+
+  insert into public.institutions (institution_id, country, country_code, name_canonical, institution_name_norm)
+  values (999025, 'UK', 'GB', 'Fuzzy Accept Uni', 'fuzzy accept uni')
+  returning institution_id into v_inst_id;
+
+  insert into public.signups (
+    cw_year, signup_timestamp, full_name, email,
+    representing_institution, participation_type,
+    institution_name_for_match, institution_name_norm,
+    country, country_code
+  ) values (
+    9999, now(), 'Fuzzy User', 'fuzzyaccept@test.com',
+    'Yes', 'University',
+    'Fuzzy Accapt Uni', 'fuzzy accapt uni',
+    'UK', 'GB'
+  );
+
+  select review_id into v_review_id
+  from public.institution_review
+  where cw_year = 9999 and institution_name_norm = 'fuzzy accapt uni';
+
+  assert v_review_id is not null, 'FAIL: Review row should exist';
+
+  -- Simulate what fn_generate_match_suggestions would produce
+  update public.institution_review
+  set suggested_institution_id   = v_inst_id,
+      suggested_institution_name = 'Fuzzy Accept Uni',
+      confidence                 = 90
+  where review_id = v_review_id;
+
+  -- Auto-accept should propagate match_source = 'fuzzy_auto_accept'
+  perform public.fn_auto_accept_suggestions(p_threshold := 65, p_cw_year := 9999);
+
+  select match_source into v_src
+  from public.signups
+  where cw_year = 9999 and email = 'fuzzyaccept@test.com';
+
+  assert v_src = 'fuzzy_auto_accept',
+    'FAIL: Expected match_source = fuzzy_auto_accept, got ' || coalesce(v_src, 'NULL');
+
+  raise notice 'PASS: Fuzzy auto-accepted signup has match_source = fuzzy_auto_accept';
+
+  delete from public.signups where cw_year = 9999;
+  delete from public.institution_review where cw_year = 9999;
+  delete from public.institution_aliases where institution_id = v_inst_id;
+  delete from public.institutions where institution_id = v_inst_id;
+end;
+$$;
+
+
+-- ============================================================
+-- TEST 27: Unmatched rows have match_source IS NULL
+-- ============================================================
+do $$
+declare
+  v_signup_src     text;
+  v_fund_src       text;
+begin
+  raise notice '--- TEST 27: Unmatched rows have match_source IS NULL ---';
+
+  insert into public.signups (
+    cw_year, signup_timestamp, full_name, email,
+    representing_institution, participation_type,
+    institution_name_for_match, institution_name_norm,
+    country, country_code
+  ) values (
+    9999, now(), 'Null Source User', 'nullsrc@test.com',
+    'Yes', 'University',
+    'Unmatched Source Uni', 'unmatched source uni',
+    'UK', 'GB'
+  );
+
+  insert into public.fundraising (cw_year, community_sponsor_id, institution_name)
+  values (9999, 99025, 'Unmatched Source Uni');
+
+  select match_source into v_signup_src
+  from public.signups
+  where cw_year = 9999 and email = 'nullsrc@test.com';
+
+  select match_source into v_fund_src
+  from public.fundraising
+  where cw_year = 9999 and community_sponsor_id = 99025;
+
+  assert v_signup_src is null,
+    'FAIL: Unmatched signup should have NULL match_source, got ' || v_signup_src;
+  assert v_fund_src is null,
+    'FAIL: Unmatched fundraising should have NULL match_source, got ' || v_fund_src;
+
+  raise notice 'PASS: Unmatched rows have match_source IS NULL';
+
+  delete from public.signups where cw_year = 9999;
+  delete from public.fundraising where cw_year = 9999;
+  delete from public.institution_review where cw_year = 9999;
+end;
+$$;
+
+
+-- ============================================================
+-- TEST 28: Existing institutions can be backfilled to parent_id
+-- Migration: migrate_institution_parent_id.sql
+-- ============================================================
+do $$
+declare
+  v_missing_parent_count int;
+begin
+  raise notice '--- TEST 28: Existing institutions backfill parent_id ---';
+
+  insert into public.institutions (
+    institution_id,
+    parent_id,
+    country,
+    country_code,
+    name_canonical,
+    institution_name_norm
+  ) values
+    (999101, null, 'UK', 'GB', 'Backfill Parent One', 'backfill parent one'),
+    (999102, null, 'US', 'US', 'Backfill Parent Two', 'backfill parent two');
+
+  update public.institutions
+  set parent_id = institution_id
+  where institution_id in (999101, 999102)
+    and parent_id is null;
+
+  select count(*) into v_missing_parent_count
+  from public.institutions
+  where institution_id in (999101, 999102)
+    and parent_id is distinct from institution_id;
+
+  assert v_missing_parent_count = 0,
+    'FAIL: Expected backfilled parent_id = institution_id for all rows, got ' || v_missing_parent_count;
+
+  raise notice 'PASS: Existing institutions backfilled parent_id to institution_id';
+
+  delete from public.institutions where institution_id in (999101, 999102);
+end;
+$$;
+
+
+-- ============================================================
+-- TEST 29: New institutions default parent_id to institution_id
+-- Trigger: trg_initialize_institution_parent_id
+-- ============================================================
+do $$
+declare
+  v_inst_id int;
+  v_parent_id int;
+begin
+  raise notice '--- TEST 29: New institutions default parent_id ---';
+
+  insert into public.institutions (
+    institution_id,
+    country,
+    country_code,
+    name_canonical,
+    institution_name_norm
+  ) values (
+    999103,
+    'UK',
+    'GB',
+    'Default Parent University',
+    'default parent university'
+  )
+  returning institution_id, parent_id into v_inst_id, v_parent_id;
+
+  assert v_parent_id = v_inst_id,
+    'FAIL: Expected parent_id to default to institution_id ' || v_inst_id || ', got ' || coalesce(v_parent_id::text, 'NULL');
+
+  raise notice 'PASS: New institution inherited parent_id from institution_id';
+
+  delete from public.institution_aliases where institution_id = v_inst_id;
+  delete from public.institutions where institution_id = v_inst_id;
+end;
+$$;
+
+
+-- ============================================================
+-- TEST 30: Explicit parent_id is preserved on insert
+-- Trigger: trg_initialize_institution_parent_id
+-- ============================================================
+do $$
+declare
+  v_parent_id int;
+begin
+  raise notice '--- TEST 30: Explicit parent_id is preserved ---';
+
+  insert into public.institutions (
+    institution_id,
+    parent_id,
+    country,
+    country_code,
+    name_canonical,
+    institution_name_norm
+  ) values (
+    999104,
+    555000,
+    'UK',
+    'GB',
+    'Explicit Parent University',
+    'explicit parent university'
+  )
+  returning parent_id into v_parent_id;
+
+  assert v_parent_id = 555000,
+    'FAIL: Expected explicit parent_id to be preserved, got ' || coalesce(v_parent_id::text, 'NULL');
+
+  raise notice 'PASS: Explicit parent_id was preserved on insert';
+
+  delete from public.institution_aliases where institution_id = 999104;
+  delete from public.institutions where institution_id = 999104;
+end;
+$$;
+
+
+-- ============================================================
 -- SUMMARY
 -- ============================================================
 do $$

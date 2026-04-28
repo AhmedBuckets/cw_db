@@ -48,6 +48,7 @@ The master list of all known institutions.
 | Column | Type | Description |
 |--------|------|-------------|
 | `institution_id` | `integer` (identity) | Primary key, auto-generated |
+| `parent_id` | `integer` | Plain parent institution identifier with no self-referential foreign key; currently initialized from `institution_id` on insert unless supplied explicitly |
 | `country` | `text` | Country name (e.g. `'UK'`) |
 | `country_code` | `text` | ISO country code (e.g. `'GB'`) |
 | `name_canonical` | `text` | The official/canonical institution name |
@@ -59,6 +60,7 @@ The master list of all known institutions.
 **Indexes:** `institution_name_norm`
 
 **Triggers:**
+- `trg_initialize_institution_parent_id` — on INSERT, initializes `parent_id` from `institution_id` when `parent_id` is NULL
 - `trg_auto_match_on_new_institution` — on INSERT, auto-matches waiting signups
 
 ---
@@ -100,6 +102,7 @@ Individual signup records submitted each CW year.
 | `participation_type` | `text` | `'University'`, `'Individual'`, etc. |
 | `institution_id` | `integer` | FK → `institutions`. NULL if unmatched |
 | `institution_match_status` | `text` | `'matched'` or NULL |
+| `match_source` | `text` | How the match was made (see values below). NULL means unmatched or legacy row with no backfill |
 | `institution_name_raw` | `text` | Original name as typed by the user |
 | `institution_name_for_match` | `text` | Cleaned name used for display/matching |
 | `institution_name_norm` | `text` | Lowercase normalised name — the actual matching key |
@@ -156,6 +159,7 @@ Fundraising rows imported from the fundraising feed. These rows can link to know
 | `institution_name_norm` | `text` | Lowercase normalised name used for matching |
 | `institution_id` | `integer` | FK → `institutions`. NULL if unmatched |
 | `institution_match_status` | `text` | `'matched'` or NULL |
+| `match_source` | `text` | How the match was made (see values below). NULL means unmatched or legacy row with no backfill |
 | `region` / `state` | `text` | Geographic context from the fundraising file |
 | `launch_good`, `venmo`, `check_amount`, `school_check`, `corporate_match`, `money_order_other`, `total` | `numeric` | Donation amounts by channel |
 | `banking_status` | `text` | Banking state of the fundraising line |
@@ -214,7 +218,19 @@ Fundraising rows imported from the fundraising feed. These rows can link to know
 
 ---
 
-### 3. `fn_auto_match_on_new_institution()`
+### 3. `fn_initialize_institution_parent_id()`
+
+**Fires:** BEFORE INSERT on `institutions`
+
+**Purpose:** Initializes `parent_id` for new institution rows without preventing callers from supplying an explicit parent.
+
+**Behaviour:**
+- If `parent_id IS NULL`, sets `parent_id = institution_id`
+- If the caller supplied `parent_id`, leaves that value unchanged
+
+---
+
+### 4. `fn_auto_match_on_new_institution()`
 
 **Fires:** AFTER INSERT on `institutions`
 
@@ -227,7 +243,7 @@ Fundraising rows imported from the fundraising feed. These rows can link to know
 
 ---
 
-### 4. `fn_auto_match_on_alias_insert()`
+### 5. `fn_auto_match_on_alias_insert()`
 
 **Fires:** AFTER INSERT on `institution_aliases`
 
@@ -337,6 +353,23 @@ All matching is based on **two keys**: `institution_name_norm` (lowercase normal
 | **Year independence** | Aliases and institutions match signups across all CW years |
 | **No overwrite** | A signup that already has an `institution_id` is never re-matched by any trigger |
 | **Deduplication** | Alias inserts use `ON CONFLICT DO NOTHING` — inserting the same alias twice is safe |
+
+---
+
+## `match_source` Field
+
+`institution_match_status` and `match_source` are always written together when a row becomes matched. `match_source` records the mechanism that assigned the match and is never changed after it is set.
+
+| Value | Meaning |
+|-------|---------|
+| `exact_name_norm` | Row was inserted with `institution_id` already set (pre-matched by the caller via exact normalised name lookup) |
+| `auto_institution_insert` | Row was matched automatically when a new institution was inserted (`fn_auto_match_on_new_institution`) |
+| `auto_alias_insert` | Row was matched automatically when a new alias was inserted (`fn_auto_match_on_alias_insert`) |
+| `fuzzy_auto_accept` | Signup row was matched via fuzzy suggestion auto-accept (`fn_auto_accept_suggestions`) |
+| `manual_admin` | Row was matched by an admin explicitly resolving an `institution_review` row |
+| `NULL` | Row is unmatched, or is a legacy row from before this field was added (no backfill was performed) |
+
+> **Note on legacy rows:** Rows that were matched before `match_source` was introduced will have `match_source IS NULL` even though `institution_id` is set and `institution_match_status = 'matched'`. This is expected — `NULL` on an already-matched row means "legacy/unbackfilled", not "unmatched".
 
 ---
 

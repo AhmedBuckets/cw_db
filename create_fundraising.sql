@@ -7,6 +7,7 @@ create table public.fundraising (
   institution_name_for_match text null,
   institution_name_norm text null,
   institution_match_status text null,
+  match_source         text null,
   region               text null,
   state                text null,
   launch_good          numeric(12,2) not null default 0,

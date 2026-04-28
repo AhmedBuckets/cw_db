@@ -11,7 +11,11 @@
 alter table public.fundraising
   add column if not exists institution_name_for_match text null,
   add column if not exists institution_name_norm text null,
-  add column if not exists institution_match_status text null;
+  add column if not exists institution_match_status text null,
+  add column if not exists match_source text null;
+
+alter table public.signups
+  add column if not exists match_source text null;
 
 create index if not exists fundraising_cw_year_name_norm_idx
   on public.fundraising using btree (cw_year, institution_name_norm) tablespace pg_default;
@@ -33,3 +37,5 @@ set institution_name_for_match = nullif(btrim(coalesce(institution_name, '')), '
       when institution_id is not null then 'matched'
       else institution_match_status
     end;
+
+    
